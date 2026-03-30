@@ -1,7 +1,9 @@
 """FastMCP server exposing OpenAI Usage and Costs tools."""
 
+import calendar
 import json
 import os
+import statistics
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -10,19 +12,99 @@ from fastmcp import Context, FastMCP
 
 from openai_usage_mcp.client import OpenAIUsageClient
 
+# ---------------------------------------------------------------------------
+# Tool descriptions (AWS-style: USE FOR / DON'T USE FOR / DEFAULTS / EXAMPLES)
+# ---------------------------------------------------------------------------
+
+COSTS_DESCRIPTION = (
+    "Query OpenAI dollar-amount spend data.\n\n"
+    "USE THIS TOOL FOR:\n"
+    "- Total spend over a date range (summary mode, default)\n"
+    "- Daily cost breakdown by line item or project\n"
+    "- Month-to-date spend with projected month-end forecast\n"
+    "- Identifying cost anomalies (spike days highlighted in summary)\n\n"
+    "DO NOT USE THIS TOOL FOR:\n"
+    "- Token or request counts (use 'usage' tool instead)\n"
+    "- Comparing two different months side by side (use 'cost-comparison' tool)\n\n"
+    "DETAIL LEVELS:\n"
+    "- summary (default): Compact total + top-N breakdown table (~20 lines). "
+    "Includes projected month-end spend and anomaly detection when applicable.\n"
+    "- daily: Per-day breakdown with per-item amounts.\n"
+    "- raw: Full unprocessed data, every line item every day.\n\n"
+    "DEFAULTS: detail_level='summary', group_by='line_item', top_n=10, end_time=today\n\n"
+    "EXAMPLES:\n"
+    '- This month\'s spend: start_time="2026-03-01"\n'
+    '- Last 7 days by project: start_time="2026-03-23", group_by="project_id"\n'
+    '- Daily breakdown for February: start_time="2026-02-01", end_time="2026-03-01", detail_level="daily"\n\n'
+    "Dates in YYYY-MM-DD format."
+)
+
+USAGE_DESCRIPTION = (
+    "Query OpenAI token and request usage data by service type.\n\n"
+    "USE THIS TOOL FOR:\n"
+    "- Token consumption (input, output, cached) by model\n"
+    "- Request counts over time\n"
+    "- Usage breakdown by model, project, or API key\n"
+    "- Image generation counts, audio seconds, etc.\n\n"
+    "DO NOT USE THIS TOOL FOR:\n"
+    "- Dollar-amount costs (use 'costs' tool instead)\n"
+    "- Month-over-month cost comparisons (use 'cost-comparison' tool)\n\n"
+    "SERVICE TYPES: completions, embeddings, images, audio_speeches, "
+    "audio_transcriptions, moderations, vector_stores, code_interpreter_sessions\n\n"
+    "DETAIL LEVELS:\n"
+    "- summary (default): Compact table aggregated by model with totals.\n"
+    "- daily: Per-day breakdown.\n"
+    "- raw: Full unprocessed data.\n\n"
+    "DEFAULTS: detail_level='summary', bucket_width='1d', top_n=10, end_time=today\n\n"
+    "EXAMPLES:\n"
+    '- GPT-4o usage this month: service_type="completions", start_time="2026-03-01", models="gpt-4o"\n'
+    '- All completions last week: service_type="completions", start_time="2026-03-23"\n'
+    '- Embeddings by project: service_type="embeddings", start_time="2026-03-01", group_by="project_id"\n\n'
+    "Dates in YYYY-MM-DD format."
+)
+
+COST_COMPARISON_DESCRIPTION = (
+    "Compare OpenAI costs between two months to identify spending changes.\n\n"
+    "USE THIS TOOL FOR:\n"
+    "- Month-over-month cost variance analysis (e.g., February vs March)\n"
+    "- Identifying which line items increased or decreased the most\n"
+    "- Executive-level cost change summaries\n\n"
+    "DO NOT USE THIS TOOL FOR:\n"
+    "- Single-month cost analysis (use 'costs' tool instead)\n"
+    "- Token or request usage data (use 'usage' tool instead)\n"
+    "- Arbitrary date range comparisons (this tool compares full calendar months only)\n\n"
+    "PARAMETERS:\n"
+    '- baseline_month: Earlier month in YYYY-MM format (e.g., "2026-02")\n'
+    '- comparison_month: Later month in YYYY-MM format (e.g., "2026-03")\n'
+    '- group_by: "line_item" (default), "project_id", or both\n'
+    "- top_n: Number of items to show (default 10)\n\n"
+    "OUTPUT includes:\n"
+    "- Total spend for each month with overall delta and % change\n"
+    "- Per-line-item comparison table with delta and % change\n"
+    "- Biggest movers section highlighting largest increase and decrease\n\n"
+    "EXAMPLES:\n"
+    '- February vs March: baseline_month="2026-02", comparison_month="2026-03"\n'
+    '- By project: baseline_month="2026-02", comparison_month="2026-03", group_by="project_id"'
+)
+
 mcp = FastMCP(
     name="openai-usage-mcp",
     instructions=(
-        "OpenAI Usage and Costs MCP Server. Provides two tools:\n"
-        "- costs: Query dollar-amount spend data, grouped by line item or project\n"
-        "- usage: Query token/request usage data for any OpenAI service type\n\n"
+        "OpenAI Usage and Costs MCP Server. Provides three tools:\n"
+        "- costs: Query dollar-amount spend data with summary, daily, or raw detail levels\n"
+        "- usage: Query token/request usage data for any OpenAI service type\n"
+        "- cost-comparison: Compare costs between two months\n\n"
         "Requires an OpenAI Admin API key (OPENAI_ADMIN_KEY env var).\n"
-        "Dates should be provided in YYYY-MM-DD format.\n"
-        "Both tools default to 'summary' mode which returns compact aggregated data.\n"
+        "Dates should be provided in YYYY-MM-DD format (or YYYY-MM for cost-comparison).\n"
+        "Both costs and usage tools default to 'summary' mode which returns compact aggregated data.\n"
         "Use detail_level='daily' or 'raw' for granular breakdowns."
     ),
 )
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def parse_date_to_unix(date_str: Optional[str]) -> Optional[int]:
     """Convert a YYYY-MM-DD date string to Unix timestamp (UTC)."""
@@ -54,6 +136,20 @@ def _parse_list_param(raw: Optional[str], default: list[str] | None = None) -> l
     return [s.strip() for s in raw.split(",")]
 
 
+def _month_to_range(month_str: str) -> tuple[int, int]:
+    """Convert 'YYYY-MM' to (start_unix, end_unix) spanning that full month."""
+    dt = datetime.strptime(month_str, "%Y-%m").replace(tzinfo=timezone.utc)
+    year, month = dt.year, dt.month
+    start = int(dt.timestamp())
+    # Roll to first of next month
+    if month == 12:
+        end_dt = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end_dt = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+    end = int(end_dt.timestamp())
+    return start, end
+
+
 VALID_SERVICE_TYPES = [
     "completions", "embeddings", "images", "audio_speeches",
     "audio_transcriptions", "moderations", "vector_stores",
@@ -66,6 +162,92 @@ USAGE_NUMERIC_FIELDS = [
     "num_model_requests", "num_images", "num_sessions",
     "characters", "seconds",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Forecast and anomaly helpers
+# ---------------------------------------------------------------------------
+
+def _compute_forecast(buckets: list[dict[str, Any]], grand_total: float) -> str | None:
+    """Compute projected month-end spend from partial-month data.
+
+    Returns a forecast line if the data starts on the 1st of a month and
+    covers fewer days than the full month. Returns None otherwise.
+    """
+    if not buckets or grand_total <= 0:
+        return None
+
+    first_dt = datetime.fromtimestamp(buckets[0]["start_time"], tz=timezone.utc)
+    if first_dt.day != 1:
+        return None
+
+    days_elapsed = len(buckets)
+    total_days = calendar.monthrange(first_dt.year, first_dt.month)[1]
+
+    if days_elapsed >= total_days:
+        return None
+
+    daily_avg = grand_total / days_elapsed
+    projected = daily_avg * total_days
+    remaining = total_days - days_elapsed
+
+    return (
+        f"\n**Projected month-end: ${projected:,.2f}** "
+        f"(based on ${daily_avg:,.2f}/day avg, {remaining} days remaining)"
+    )
+
+
+def _detect_anomalies(
+    buckets: list[dict[str, Any]], threshold_sigma: float = 2.0,
+) -> str | None:
+    """Detect daily spending anomalies using standard deviation.
+
+    Returns a compact table of spike days, or None if no anomalies found.
+    Requires at least 7 days of data and a mean > $1/day to avoid noise.
+    """
+    if len(buckets) < 7:
+        return None
+
+    daily: list[tuple[str, float]] = []
+    for b in buckets:
+        date = unix_to_date(b["start_time"])
+        total = sum(r["amount"]["value"] for r in b.get("results", []))
+        daily.append((date, total))
+
+    amounts = [a for _, a in daily]
+    mean = statistics.mean(amounts)
+
+    if mean < 1.0:
+        return None
+
+    try:
+        stdev = statistics.stdev(amounts)
+    except statistics.StatisticsError:
+        return None
+
+    if stdev == 0:
+        return None
+
+    threshold = mean + threshold_sigma * stdev
+    anomalies = [(date, amt) for date, amt in daily if amt > threshold]
+
+    if not anomalies:
+        return None
+
+    # Sort by deviation magnitude, cap at 5
+    anomalies.sort(key=lambda x: x[1], reverse=True)
+    anomalies = anomalies[:5]
+
+    lines = [
+        f"\n### Anomalies (>{threshold_sigma}σ from mean)",
+        "| Date | Amount | vs Avg |",
+        "|------|--------|--------|",
+    ]
+    for date, amt in anomalies:
+        pct_above = ((amt - mean) / mean) * 100
+        lines.append(f"| {date} | ${amt:,.2f} | +{pct_above:.0f}% |")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +296,16 @@ def format_costs_summary(buckets: list[dict[str, Any]], top_n: int = 10) -> str:
         other_total = sum(amount for _, amount in other_items)
         other_pct = (other_total / grand_total) * 100
         lines.append(f"| Other ({len(other_items)} items) | ${other_total:,.2f} | {other_pct:.1f}% |")
+
+    # Append forecast if applicable
+    forecast = _compute_forecast(buckets, grand_total)
+    if forecast:
+        lines.append(forecast)
+
+    # Append anomaly detection if applicable
+    anomalies = _detect_anomalies(buckets)
+    if anomalies:
+        lines.append(anomalies)
 
     return "\n".join(lines)
 
@@ -184,6 +376,101 @@ def format_costs_response(buckets: list[dict[str, Any]]) -> str:
 
     header = f"# OpenAI Costs — Total: ${grand_total:.2f}\n"
     return header + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Cost comparison formatter
+# ---------------------------------------------------------------------------
+
+def format_cost_comparison(
+    baseline_buckets: list[dict[str, Any]],
+    comparison_buckets: list[dict[str, Any]],
+    baseline_label: str,
+    comparison_label: str,
+    top_n: int = 10,
+) -> str:
+    """Compare costs between two periods and format as a delta table."""
+    if not baseline_buckets and not comparison_buckets:
+        return "No cost data found for either period."
+
+    def _aggregate(buckets: list[dict[str, Any]]) -> tuple[defaultdict[str, float], float]:
+        totals: defaultdict[str, float] = defaultdict(float)
+        grand = 0.0
+        for bucket in buckets:
+            for r in bucket.get("results", []):
+                amount = r["amount"]["value"]
+                label = r.get("line_item") or r.get("project_id") or "unknown"
+                totals[label] += amount
+                grand += amount
+        return totals, grand
+
+    base_totals, base_grand = _aggregate(baseline_buckets)
+    comp_totals, comp_grand = _aggregate(comparison_buckets)
+
+    overall_delta = comp_grand - base_grand
+    overall_pct = ((overall_delta / base_grand) * 100) if base_grand > 0 else 0.0
+    delta_sign = "+" if overall_delta >= 0 else ""
+
+    # Build per-item deltas
+    all_labels = set(base_totals.keys()) | set(comp_totals.keys())
+    items: list[tuple[str, float, float, float, str]] = []
+    for label in all_labels:
+        b_amt = base_totals.get(label, 0.0)
+        c_amt = comp_totals.get(label, 0.0)
+        delta = c_amt - b_amt
+        if b_amt > 0:
+            pct_str = f"{(delta / b_amt) * 100:+.1f}%"
+        elif c_amt > 0:
+            pct_str = "new"
+        else:
+            pct_str = "—"
+        items.append((label, b_amt, c_amt, delta, pct_str))
+
+    # Sort by absolute delta descending
+    items.sort(key=lambda x: abs(x[3]), reverse=True)
+
+    top_items = items[:top_n]
+    other_items = items[top_n:]
+
+    lines = [
+        f"# Cost Comparison: {baseline_label} vs {comparison_label}",
+        f"**{baseline_label}: ${base_grand:,.2f}** | **{comparison_label}: ${comp_grand:,.2f}** | "
+        f"**Delta: {delta_sign}${abs(overall_delta):,.2f} ({delta_sign}{abs(overall_pct):.1f}%)**",
+        "",
+        f"| Line Item | {baseline_label} | {comparison_label} | Delta | % Change |",
+        "|-----------|----------|------------|-------|----------|",
+    ]
+
+    for label, b_amt, c_amt, delta, pct_str in top_items:
+        d_sign = "+" if delta >= 0 else ""
+        lines.append(
+            f"| {label} | ${b_amt:,.2f} | ${c_amt:,.2f} | {d_sign}${delta:,.2f} | {pct_str} |"
+        )
+
+    if other_items:
+        o_base = sum(x[1] for x in other_items)
+        o_comp = sum(x[2] for x in other_items)
+        o_delta = o_comp - o_base
+        o_sign = "+" if o_delta >= 0 else ""
+        o_pct = f"{(o_delta / o_base) * 100:+.1f}%" if o_base > 0 else ("new" if o_comp > 0 else "—")
+        lines.append(
+            f"| Other ({len(other_items)} items) | ${o_base:,.2f} | ${o_comp:,.2f} | {o_sign}${o_delta:,.2f} | {o_pct} |"
+        )
+
+    # Biggest movers
+    increases = [(l, d) for l, _, _, d, _ in items if d > 0]
+    decreases = [(l, d) for l, _, _, d, _ in items if d < 0]
+
+    if increases or decreases:
+        lines.append("\n### Biggest Movers")
+        if increases:
+            top_inc = increases[0]
+            lines.append(f"**Largest increase:** {top_inc[0]} (+${top_inc[1]:,.2f})")
+        if decreases:
+            top_dec = decreases[-1]  # most negative
+            lines.append(f"**Largest decrease:** {top_dec[0]} (-${abs(top_dec[1]):,.2f})")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -323,16 +610,7 @@ def format_usage_response(buckets: list[dict[str, Any]], service_type: str) -> s
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool(
-    name="costs",
-    description=(
-        "Query OpenAI dollar-amount spend data. "
-        "Default 'summary' mode returns a compact total + top-N breakdown (~20 lines). "
-        "Use detail_level='daily' for per-day breakdown, or 'raw' for full unprocessed data. "
-        "For queries spanning more than a week, prefer 'summary' to avoid large responses. "
-        "Dates in YYYY-MM-DD format."
-    ),
-)
+@mcp.tool(name="costs", description=COSTS_DESCRIPTION)
 async def costs_tool(
     ctx: Context,
     start_time: str,
@@ -382,17 +660,7 @@ async def costs_tool(
         return f"Error querying OpenAI costs: {e}"
 
 
-@mcp.tool(
-    name="usage",
-    description=(
-        "Query OpenAI token and request usage data. "
-        "Default 'summary' mode returns a compact table aggregated by model. "
-        "Use detail_level='daily' or 'raw' for granular breakdowns. "
-        "Supports service types: completions, embeddings, images, audio_speeches, "
-        "audio_transcriptions, moderations, vector_stores, code_interpreter_sessions. "
-        "Dates in YYYY-MM-DD format."
-    ),
-)
+@mcp.tool(name="usage", description=USAGE_DESCRIPTION)
 async def usage_tool(
     ctx: Context,
     service_type: str,
@@ -459,6 +727,54 @@ async def usage_tool(
             return format_usage_summary(buckets, service_type, top_n)
     except Exception as e:
         return f"Error querying OpenAI {service_type} usage: {e}"
+
+
+@mcp.tool(name="cost-comparison", description=COST_COMPARISON_DESCRIPTION)
+async def cost_comparison_tool(
+    ctx: Context,
+    baseline_month: str,
+    comparison_month: str,
+    group_by: Optional[str] = None,
+    top_n: int = 10,
+) -> str:
+    """Compare OpenAI costs between two months.
+
+    Args:
+        baseline_month: Earlier month (YYYY-MM, e.g. "2026-02")
+        comparison_month: Later month (YYYY-MM, e.g. "2026-03")
+        group_by: Grouping fields: "line_item" (default), "project_id", or both
+        top_n: Number of top items to show (default 10)
+    """
+    try:
+        client = OpenAIUsageClient()
+
+        base_start, base_end = _month_to_range(baseline_month)
+        comp_start, comp_end = _month_to_range(comparison_month)
+
+        group_by_list = _parse_list_param(group_by, ["line_item"])
+
+        def _build_params(start: int, end: int) -> dict[str, Any]:
+            p: dict[str, Any] = {
+                "start_time": start,
+                "end_time": end,
+                "bucket_width": "1d",
+                "limit": 31,
+            }
+            for g in group_by_list:
+                p.setdefault("group_by[]", [])
+                p["group_by[]"].append(g)
+            return p
+
+        await ctx.info(f"Comparing costs: {baseline_month} vs {comparison_month}")
+        baseline_buckets = await client.get("/costs", params=_build_params(base_start, base_end))
+        comparison_buckets = await client.get("/costs", params=_build_params(comp_start, comp_end))
+
+        return format_cost_comparison(
+            baseline_buckets, comparison_buckets,
+            baseline_month, comparison_month, top_n,
+        )
+    except Exception as e:
+        return f"Error comparing OpenAI costs: {e}"
 
 
 def main():
