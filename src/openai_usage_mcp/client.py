@@ -13,6 +13,8 @@ REQUEST_TIMEOUT = 30.0
 class OpenAIUsageClient:
     """Async client for OpenAI's Usage and Costs API endpoints."""
 
+    _project_cache: Optional[dict[str, str]] = None
+
     def __init__(self, api_key: Optional[str] = None) -> None:
         self.api_key = api_key or os.environ.get("OPENAI_ADMIN_KEY", "")
         if not self.api_key:
@@ -48,6 +50,32 @@ class OpenAIUsageClient:
                 params["page"] = next_page
 
         return all_data
+
+    async def list_projects(self) -> dict[str, str]:
+        """Fetch all projects and return a mapping of project_id -> project_name.
+
+        Results are cached for the lifetime of the process to avoid repeated API calls.
+        """
+        if OpenAIUsageClient._project_cache is not None:
+            return OpenAIUsageClient._project_cache
+
+        projects: dict[str, str] = {}
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as http:
+            params: dict[str, Any] = {"limit": 100, "include_archived": True}
+            for _ in range(MAX_PAGES):
+                response = await self._request(http, "/projects", params)
+                body = response.json()
+                for proj in body.get("data", []):
+                    projects[proj["id"]] = proj["name"]
+                if not body.get("has_more"):
+                    break
+                last_id = body.get("last_id")
+                if not last_id:
+                    break
+                params["after"] = last_id
+
+        OpenAIUsageClient._project_cache = projects
+        return projects
 
     async def _request(self, http: httpx.AsyncClient, path: str, params: dict[str, Any]) -> httpx.Response:
         """Execute a single request with one retry on 429."""

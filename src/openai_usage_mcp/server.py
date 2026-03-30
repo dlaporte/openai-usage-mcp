@@ -109,6 +109,28 @@ mcp = FastMCP(
 VALID_DETAIL_LEVELS = ("summary", "daily", "raw")
 
 
+async def _get_project_map(client: OpenAIUsageClient) -> dict[str, str]:
+    """Get the project ID -> name mapping, falling back gracefully on error."""
+    try:
+        return await client.list_projects()
+    except Exception:
+        return {}
+
+
+def _resolve_project_ids_in_buckets(
+    buckets: list[dict[str, Any]], project_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Replace project_id values with human-readable project names in bucket data."""
+    if not project_map:
+        return buckets
+    for bucket in buckets:
+        for r in bucket.get("results", []):
+            pid = r.get("project_id")
+            if pid and pid in project_map:
+                r["project_id"] = project_map[pid]
+    return buckets
+
+
 def parse_date_to_unix(date_str: Optional[str]) -> Optional[int]:
     """Convert a YYYY-MM-DD date string to Unix timestamp (UTC)."""
     if date_str is None:
@@ -671,6 +693,9 @@ async def costs_tool(
         await ctx.info(f"Querying OpenAI costs from {start_time} to {end_time or 'now'}")
         buckets = await client.get("/costs", params=params)
 
+        project_map = await _get_project_map(client)
+        _resolve_project_ids_in_buckets(buckets, project_map)
+
         if detail_level == "daily":
             return format_costs_daily(buckets, top_n)
         elif detail_level == "raw":
@@ -745,6 +770,9 @@ async def usage_tool(
         await ctx.info(f"Querying OpenAI {service_type} usage from {start_time} to {end_time or 'now'}")
         buckets = await client.get(f"/usage/{service_type}", params=params)
 
+        project_map = await _get_project_map(client)
+        _resolve_project_ids_in_buckets(buckets, project_map)
+
         if detail_level == "raw":
             return format_usage_response(buckets, service_type)
         else:
@@ -792,6 +820,10 @@ async def cost_comparison_tool(
         await ctx.info(f"Comparing costs: {baseline_month} vs {comparison_month}")
         baseline_buckets = await client.get("/costs", params=_build_params(base_start, base_end))
         comparison_buckets = await client.get("/costs", params=_build_params(comp_start, comp_end))
+
+        project_map = await _get_project_map(client)
+        _resolve_project_ids_in_buckets(baseline_buckets, project_map)
+        _resolve_project_ids_in_buckets(comparison_buckets, project_map)
 
         return format_cost_comparison(
             baseline_buckets, comparison_buckets,
