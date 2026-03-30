@@ -658,7 +658,6 @@ async def costs_tool(
     detail_level: str = "summary",
     group_by: Optional[str] = None,
     top_n: int = 10,
-    limit: int = 180,
 ) -> str:
     """Query OpenAI costs for a date range.
 
@@ -668,7 +667,6 @@ async def costs_tool(
         detail_level: "summary" (default, compact totals), "daily" (per-day), or "raw" (full detail)
         group_by: Grouping fields: "line_item", "project_id", or both. Accepts bare string, comma-separated, or JSON array.
         top_n: Number of top items to show (default 10, used in summary and daily modes)
-        limit: Max daily buckets to fetch (1-180, default 180)
     """
     if detail_level not in VALID_DETAIL_LEVELS:
         return f"Invalid detail_level '{detail_level}'. Must be one of: {', '.join(VALID_DETAIL_LEVELS)}"
@@ -679,7 +677,6 @@ async def costs_tool(
         params: dict[str, Any] = {
             "start_time": parse_date_to_unix(start_time),
             "bucket_width": "1d",
-            "limit": min(max(limit, 1), 180),
         }
 
         if end_time:
@@ -691,7 +688,7 @@ async def costs_tool(
             params["group_by[]"].append(g)
 
         await ctx.info(f"Querying OpenAI costs from {start_time} to {end_time or 'now'}")
-        buckets = await client.get("/costs", params=params)
+        buckets = await client.get_chunked("/costs", params=params)
 
         project_map = await _get_project_map(client)
         _resolve_project_ids_in_buckets(buckets, project_map)
@@ -718,7 +715,6 @@ async def usage_tool(
     models: Optional[str] = None,
     project_ids: Optional[str] = None,
     top_n: int = 10,
-    limit: int = 180,
 ) -> str:
     """Query OpenAI usage for a service type and date range.
 
@@ -732,7 +728,6 @@ async def usage_tool(
         models: Model names to filter (e.g. "gpt-4o" or '["gpt-4o"]')
         project_ids: Project IDs to filter
         top_n: Number of top models to show (default 10, used in summary mode)
-        limit: Max buckets to fetch (default 180)
     """
     if service_type not in VALID_SERVICE_TYPES:
         return f"Invalid service_type '{service_type}'. Must be one of: {', '.join(VALID_SERVICE_TYPES)}"
@@ -749,7 +744,6 @@ async def usage_tool(
         params: dict[str, Any] = {
             "start_time": parse_date_to_unix(start_time),
             "bucket_width": bucket_width,
-            "limit": min(max(limit, 1), 180),
         }
 
         if end_time:
@@ -768,7 +762,7 @@ async def usage_tool(
             params["project_ids[]"].append(p)
 
         await ctx.info(f"Querying OpenAI {service_type} usage from {start_time} to {end_time or 'now'}")
-        buckets = await client.get(f"/usage/{service_type}", params=params)
+        buckets = await client.get_chunked(f"/usage/{service_type}", params=params)
 
         project_map = await _get_project_map(client)
         _resolve_project_ids_in_buckets(buckets, project_map)
@@ -810,7 +804,6 @@ async def cost_comparison_tool(
                 "start_time": start,
                 "end_time": end,
                 "bucket_width": "1d",
-                "limit": 31,
             }
             for g in group_by_list:
                 p.setdefault("group_by[]", [])
@@ -818,8 +811,8 @@ async def cost_comparison_tool(
             return p
 
         await ctx.info(f"Comparing costs: {baseline_month} vs {comparison_month}")
-        baseline_buckets = await client.get("/costs", params=_build_params(base_start, base_end))
-        comparison_buckets = await client.get("/costs", params=_build_params(comp_start, comp_end))
+        baseline_buckets = await client.get_chunked("/costs", params=_build_params(base_start, base_end))
+        comparison_buckets = await client.get_chunked("/costs", params=_build_params(comp_start, comp_end))
 
         project_map = await _get_project_map(client)
         _resolve_project_ids_in_buckets(baseline_buckets, project_map)

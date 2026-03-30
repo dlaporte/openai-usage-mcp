@@ -9,6 +9,9 @@ BASE_URL = "https://api.openai.com/v1/organization"
 MAX_PAGES = 50
 REQUEST_TIMEOUT = 30.0
 
+# OpenAI API enforces these max bucket counts per bucket_width.
+BUCKET_LIMITS = {"1d": 31, "1h": 168, "1m": 1440}
+
 
 class OpenAIUsageClient:
     """Async client for OpenAI's Usage and Costs API endpoints."""
@@ -76,6 +79,51 @@ class OpenAIUsageClient:
 
         OpenAIUsageClient._project_cache = projects
         return projects
+
+    async def get_chunked(
+        self, path: str, params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Query a date range, automatically chunking to respect API bucket limits.
+
+        Splits [start_time, end_time) into windows of at most BUCKET_LIMITS[bucket_width]
+        days/hours/minutes and merges results. Callers no longer need to worry about
+        the OpenAI API's per-request bucket cap.
+
+        Requires params to contain 'start_time' (int) and 'bucket_width' (str).
+        'end_time' is optional — defaults to now.
+        """
+        import time
+
+        bucket_width = params.get("bucket_width", "1d")
+        max_buckets = BUCKET_LIMITS.get(bucket_width, 31)
+
+        # Seconds per bucket
+        seconds_per_bucket = {"1d": 86400, "1h": 3600, "1m": 60}.get(bucket_width, 86400)
+        chunk_seconds = max_buckets * seconds_per_bucket
+
+        start = params["start_time"]
+        end = params.get("end_time") or int(time.time())
+
+        if end - start <= chunk_seconds:
+            # Fits in one request — fast path
+            chunk_params = dict(params)
+            chunk_params["limit"] = max_buckets
+            return await self.get(path, chunk_params)
+
+        # Split into chunks
+        all_data: list[dict[str, Any]] = []
+        cursor = start
+        while cursor < end:
+            chunk_end = min(cursor + chunk_seconds, end)
+            chunk_params = dict(params)
+            chunk_params["start_time"] = cursor
+            chunk_params["end_time"] = chunk_end
+            chunk_params["limit"] = max_buckets
+
+            all_data.extend(await self.get(path, chunk_params))
+            cursor = chunk_end
+
+        return all_data
 
     async def _request(self, http: httpx.AsyncClient, path: str, params: dict[str, Any]) -> httpx.Response:
         """Execute a single request with one retry on 429."""
