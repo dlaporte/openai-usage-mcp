@@ -2,7 +2,7 @@ import os
 import pytest
 import httpx
 import respx
-from openai_usage_mcp.client import OpenAIUsageClient, BASE_URL
+from openai_usage_mcp.client import OpenAIUsageClient, BASE_URL, MAX_PAGES, REQUEST_TIMEOUT
 
 
 def test_client_init_with_key():
@@ -20,6 +20,11 @@ def test_client_init_missing_key_raises(monkeypatch):
     monkeypatch.delenv("OPENAI_ADMIN_KEY", raising=False)
     with pytest.raises(ValueError, match="OPENAI_ADMIN_KEY"):
         OpenAIUsageClient()
+
+
+def test_constants_are_sane():
+    assert MAX_PAGES >= 10
+    assert REQUEST_TIMEOUT >= 10.0
 
 
 @pytest.mark.asyncio
@@ -98,3 +103,19 @@ async def test_request_rate_limit_retry():
     client = OpenAIUsageClient(api_key="sk-admin-test")
     result = await client.get("/costs", params={"start_time": 1000})
     assert len(result) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_pagination_guard_stops_at_max_pages():
+    """Pagination should stop after MAX_PAGES even if next_page keeps coming."""
+    respx.get(f"{BASE_URL}/costs").mock(
+        return_value=httpx.Response(200, json={
+            "object": "page",
+            "data": [{"object": "bucket", "start_time": 1000, "end_time": 2000, "results": []}],
+            "next_page": "always_more",
+        })
+    )
+    client = OpenAIUsageClient(api_key="sk-admin-test")
+    result = await client.get("/costs", params={"start_time": 1000})
+    assert len(result) == MAX_PAGES  # 1 bucket per page, capped at MAX_PAGES

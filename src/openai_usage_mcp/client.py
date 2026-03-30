@@ -6,6 +6,8 @@ from typing import Any, Optional
 import httpx
 
 BASE_URL = "https://api.openai.com/v1/organization"
+MAX_PAGES = 50
+REQUEST_TIMEOUT = 30.0
 
 
 class OpenAIUsageClient:
@@ -29,12 +31,13 @@ class OpenAIUsageClient:
         """Make a GET request, handling pagination automatically.
 
         Returns a flat list of all data items across all pages.
+        Pagination is capped at MAX_PAGES to prevent runaway loops.
         """
         params = dict(params or {})
         all_data: list[dict[str, Any]] = []
 
-        async with httpx.AsyncClient() as http:
-            while True:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as http:
+            for _ in range(MAX_PAGES):
                 response = await self._request(http, path, params)
                 body = response.json()
                 all_data.extend(body.get("data", []))

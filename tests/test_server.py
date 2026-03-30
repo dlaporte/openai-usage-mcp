@@ -55,6 +55,29 @@ def test_parse_list_param_json_single():
     assert _parse_list_param('["line_item"]') == ["line_item"]
 
 
+def test_parse_list_param_invalid_json_array():
+    with pytest.raises(ValueError, match="Expected JSON array"):
+        _parse_list_param('[123, 456]')
+
+
+def test_parse_list_param_empty_strings_filtered():
+    assert _parse_list_param("a, , b") == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# Date parsing
+# ---------------------------------------------------------------------------
+
+def test_parse_date_invalid_format():
+    with pytest.raises(ValueError, match="Invalid date"):
+        parse_date_to_unix("March 1st")
+
+
+def test_parse_date_wrong_format():
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        parse_date_to_unix("2026/03/01")
+
+
 # ---------------------------------------------------------------------------
 # _month_to_range
 # ---------------------------------------------------------------------------
@@ -69,6 +92,11 @@ def test_month_to_range_december():
     start, end = _month_to_range("2026-12")
     assert start == parse_date_to_unix("2026-12-01")
     assert end == parse_date_to_unix("2027-01-01")
+
+
+def test_month_to_range_invalid_format():
+    with pytest.raises(ValueError, match="YYYY-MM"):
+        _month_to_range("March 2026")
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +386,16 @@ def test_format_cost_comparison_biggest_movers():
 def test_format_cost_comparison_empty():
     output = format_cost_comparison([], [], "2026-02", "2026-03")
     assert "No cost data" in output
+
+
+def test_format_cost_comparison_negative_delta_formatting():
+    """Negative deltas should show -$15.00, not -$-15.00."""
+    output = format_cost_comparison(
+        COST_BUCKETS_MONTH_A, COST_BUCKETS_MONTH_B, "2026-02", "2026-03",
+    )
+    # Embeddings went from $50 to $35, delta = -$15
+    assert "-$15.00" in output
+    assert "-$-" not in output  # no double-negative
 
 
 # ---------------------------------------------------------------------------

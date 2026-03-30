@@ -106,11 +106,19 @@ mcp = FastMCP(
 # Helpers
 # ---------------------------------------------------------------------------
 
+VALID_DETAIL_LEVELS = ("summary", "daily", "raw")
+
+
 def parse_date_to_unix(date_str: Optional[str]) -> Optional[int]:
     """Convert a YYYY-MM-DD date string to Unix timestamp (UTC)."""
     if date_str is None:
         return None
-    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise ValueError(
+            f"Invalid date '{date_str}'. Expected format: YYYY-MM-DD (e.g., '2026-03-01')"
+        )
     return int(dt.timestamp())
 
 
@@ -132,13 +140,21 @@ def _parse_list_param(raw: Optional[str], default: list[str] | None = None) -> l
         return default or []
     raw = raw.strip()
     if raw.startswith("["):
-        return json.loads(raw)
-    return [s.strip() for s in raw.split(",")]
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list) or not all(isinstance(s, str) for s in parsed):
+            raise ValueError(f"Expected JSON array of strings, got: {raw}")
+        return parsed
+    return [s.strip() for s in raw.split(",") if s.strip()]
 
 
 def _month_to_range(month_str: str) -> tuple[int, int]:
     """Convert 'YYYY-MM' to (start_unix, end_unix) spanning that full month."""
-    dt = datetime.strptime(month_str, "%Y-%m").replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.strptime(month_str, "%Y-%m").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise ValueError(
+            f"Invalid month '{month_str}'. Expected format: YYYY-MM (e.g., '2026-03')"
+        )
     year, month = dt.year, dt.month
     start = int(dt.timestamp())
     # Roll to first of next month
@@ -441,20 +457,22 @@ def format_cost_comparison(
         "|-----------|----------|------------|-------|----------|",
     ]
 
+    def _fmt_delta(delta: float) -> str:
+        sign = "+" if delta >= 0 else "-"
+        return f"{sign}${abs(delta):,.2f}"
+
     for label, b_amt, c_amt, delta, pct_str in top_items:
-        d_sign = "+" if delta >= 0 else ""
         lines.append(
-            f"| {label} | ${b_amt:,.2f} | ${c_amt:,.2f} | {d_sign}${delta:,.2f} | {pct_str} |"
+            f"| {label} | ${b_amt:,.2f} | ${c_amt:,.2f} | {_fmt_delta(delta)} | {pct_str} |"
         )
 
     if other_items:
         o_base = sum(x[1] for x in other_items)
         o_comp = sum(x[2] for x in other_items)
         o_delta = o_comp - o_base
-        o_sign = "+" if o_delta >= 0 else ""
         o_pct = f"{(o_delta / o_base) * 100:+.1f}%" if o_base > 0 else ("new" if o_comp > 0 else "—")
         lines.append(
-            f"| Other ({len(other_items)} items) | ${o_base:,.2f} | ${o_comp:,.2f} | {o_sign}${o_delta:,.2f} | {o_pct} |"
+            f"| Other ({len(other_items)} items) | ${o_base:,.2f} | ${o_comp:,.2f} | {_fmt_delta(o_delta)} | {o_pct} |"
         )
 
     # Biggest movers
@@ -630,6 +648,9 @@ async def costs_tool(
         top_n: Number of top items to show (default 10, used in summary and daily modes)
         limit: Max daily buckets to fetch (1-180, default 180)
     """
+    if detail_level not in VALID_DETAIL_LEVELS:
+        return f"Invalid detail_level '{detail_level}'. Must be one of: {', '.join(VALID_DETAIL_LEVELS)}"
+
     try:
         client = OpenAIUsageClient()
 
@@ -691,6 +712,9 @@ async def usage_tool(
     if service_type not in VALID_SERVICE_TYPES:
         return f"Invalid service_type '{service_type}'. Must be one of: {', '.join(VALID_SERVICE_TYPES)}"
 
+    if detail_level not in VALID_DETAIL_LEVELS:
+        return f"Invalid detail_level '{detail_level}'. Must be one of: {', '.join(VALID_DETAIL_LEVELS)}"
+
     if bucket_width not in ("1m", "1h", "1d"):
         return f"Invalid bucket_width '{bucket_width}'. Must be one of: 1m, 1h, 1d"
 
@@ -700,7 +724,7 @@ async def usage_tool(
         params: dict[str, Any] = {
             "start_time": parse_date_to_unix(start_time),
             "bucket_width": bucket_width,
-            "limit": limit,
+            "limit": min(max(limit, 1), 180),
         }
 
         if end_time:
