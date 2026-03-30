@@ -67,8 +67,19 @@ async def test_request_auth_error():
         return_value=httpx.Response(403, json={"error": {"message": "Invalid admin key"}})
     )
     client = OpenAIUsageClient(api_key="sk-admin-bad")
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(RuntimeError, match="403"):
         await client.get("/costs", params={"start_time": 1000})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_request_error_includes_detail():
+    respx.get(f"{BASE_URL}/costs").mock(
+        return_value=httpx.Response(400, json={"error": {"message": "Invalid start_time parameter"}})
+    )
+    client = OpenAIUsageClient(api_key="sk-admin-test")
+    with pytest.raises(RuntimeError, match="Invalid start_time parameter"):
+        await client.get("/costs", params={"start_time": -1})
 
 
 @pytest.mark.asyncio

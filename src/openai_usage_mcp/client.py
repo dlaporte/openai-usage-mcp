@@ -57,5 +57,11 @@ class OpenAIUsageClient:
             await asyncio.sleep(1)
             response = await http.get(url, headers=self._headers(), params=params)
 
-        response.raise_for_status()
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
+            except Exception:
+                detail = response.text
+            raise RuntimeError(f"OpenAI API error {response.status_code}: {detail}")
+
         return response
