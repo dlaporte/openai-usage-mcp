@@ -242,6 +242,11 @@ async def usage_tool(
 
 def main():
     """Entry point for the MCP server."""
+    if not os.environ.get("OPENAI_ADMIN_KEY"):
+        raise SystemExit(
+            "OPENAI_ADMIN_KEY environment variable is required. "
+            "Create an admin key at platform.openai.com/settings/organization/admin-keys"
+        )
     mcp.run()
 
 
